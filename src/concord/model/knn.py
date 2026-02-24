@@ -5,7 +5,7 @@ from sklearn.neighbors import NearestNeighbors
 import logging
 import math
 import torch
-import logging
+import os
 
 PKG_ROOT = __package__.split(".")[0]          # → "concord"
 logger   = logging.getLogger(f"{PKG_ROOT}")
@@ -33,7 +33,8 @@ class Neighborhood:
         use_faiss=True,
         use_ivf=False,
         ivf_nprobe=10,
-        metric='euclidean'
+        metric='euclidean',
+        num_threads=None
     ):
         """
         Initializes the Neighborhood class.
@@ -59,6 +60,7 @@ class Neighborhood:
         self.use_faiss = use_faiss
         self.use_ivf = use_ivf
         self.ivf_nprobe = ivf_nprobe
+        self.num_threads = num_threads
 
         # Validate metric
         if metric not in ("euclidean", "cosine"):
@@ -103,6 +105,10 @@ class Neighborhood:
 
         if self.use_faiss:
             import faiss
+            if self.num_threads is not None:
+                faiss.omp_set_num_threads(int(self.num_threads))
+            else:
+                faiss.omp_set_num_threads(max(1, os.cpu_count() or 1))
             n, d = self.emb.shape
 
             if self.use_ivf:
@@ -134,10 +140,18 @@ class Neighborhood:
         else:
             # Use sklearn NearestNeighbors
             if self.metric == "cosine":
-                self.nbrs = NearestNeighbors(n_neighbors=self.k + 1, metric="cosine").fit(self.emb)
+                self.nbrs = NearestNeighbors(
+                    n_neighbors=self.k + 1,
+                    metric="cosine",
+                    n_jobs=self.num_threads
+                ).fit(self.emb)
             else:
                 # Euclidean
-                self.nbrs = NearestNeighbors(n_neighbors=self.k + 1, metric="euclidean").fit(self.emb)
+                self.nbrs = NearestNeighbors(
+                    n_neighbors=self.k + 1,
+                    metric="euclidean",
+                    n_jobs=self.num_threads
+                ).fit(self.emb)
 
 
     def get_knn(self, core_samples, k=None, include_self=True, return_distance=False):
@@ -219,7 +233,6 @@ class Neighborhood:
         if return_distance:
             return indices, distances
         return indices
-
 
     def update_embedding(self, new_emb):
         """
@@ -330,3 +343,40 @@ class Neighborhood:
             logger.warning("K-NN graph is not computed. Computing now.")
             self.compute_knn_graph()
         return self.graph
+
+
+class PrecomputedNeighborhood:
+    """
+    A lightweight neighborhood wrapper backed by precomputed neighbor indices.
+    """
+    def __init__(self, knn_indices, metric="euclidean"):
+        self.knn_indices = knn_indices
+        self.metric = metric
+        self.k = knn_indices.shape[1]
+
+    def get_knn(self, core_samples, k=None, include_self=True, return_distance=False):
+        if isinstance(core_samples, torch.Tensor):
+            core_samples = core_samples.cpu().numpy()
+        core_samples = np.asarray(core_samples, dtype=np.int64)
+
+        if core_samples.ndim == 0:
+            core_samples = core_samples.reshape(1)
+
+        if k is None:
+            k = self.k
+
+        indices = np.asarray(self.knn_indices[core_samples])
+        if include_self:
+            out_idx = indices[:, :k]
+        else:
+            out_rows = []
+            for row_idx, row in enumerate(indices):
+                filtered = row[row != core_samples[row_idx]]
+                if filtered.shape[0] < k:
+                    raise ValueError("Precomputed k-NN cache has insufficient neighbors when include_self=False.")
+                out_rows.append(filtered[:k])
+            out_idx = np.stack(out_rows, axis=0)
+
+        if return_distance:
+            return out_idx, np.zeros_like(out_idx, dtype=np.float32)
+        return out_idx

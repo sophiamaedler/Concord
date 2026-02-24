@@ -138,6 +138,11 @@ class Concord:
             pretrained_model=None,
             preload_dense=False,  # Whether to densify the data in memory
             num_workers=None,  # Number of workers for DataLoader
+            cache_dir=None,
+            reuse_cache=True,
+            cache_preprocessed=True,
+            cache_neighbors=True,
+            knn_num_threads=None,
             chunked=False,
             chunk_size=10000,
             device=torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -312,6 +317,11 @@ class Concord:
             use_ivf=self.config.use_ivf, 
             ivf_nprobe=self.config.ivf_nprobe, 
             preload_dense=self.config.preload_dense,
+            cache_dir=self.config.cache_dir,
+            reuse_cache=self.config.reuse_cache,
+            cache_preprocessed=(self.config.cache_preprocessed and not self.config.chunked),
+            cache_neighbors=self.config.cache_neighbors,
+            knn_num_threads=self.config.knn_num_threads,
             device=self.config.device
         )
 

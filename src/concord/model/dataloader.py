@@ -1,18 +1,20 @@
 import torch
 from .sampler import ConcordSampler
 from .anndataset import AnnDataset
-from .knn import Neighborhood
+from .knn import Neighborhood, PrecomputedNeighborhood
 from ..utils.anndata_utils import get_adata_basis
 from torch.utils.data import DataLoader
 import numpy as np
 import scanpy as sc
 import os
 import logging
+import hashlib
+import json
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 from scipy.sparse import issparse
-import torch
 
 class AnnDataCollator:
     """
@@ -84,6 +86,11 @@ class DataLoaderManager:
                  ivf_nprobe=8,
                  preload_dense=False,
                  num_workers=None,
+                 cache_dir=None,
+                 reuse_cache=True,
+                 cache_preprocessed=True,
+                 cache_neighbors=True,
+                 knn_num_threads=None,
                  device=None):
         """
         Initializes the DataLoaderManager.
@@ -116,6 +123,13 @@ class DataLoaderManager:
             # Allow user to override
             self.num_workers = num_workers
         logger.info(f"Using {self.num_workers} DataLoader workers.")
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.reuse_cache = reuse_cache
+        self.cache_preprocessed = cache_preprocessed
+        self.cache_neighbors = cache_neighbors
+        self.knn_num_threads = knn_num_threads
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
 
 
@@ -127,6 +141,84 @@ class DataLoaderManager:
         self.val_sampler = None
 
         self.data_structure = self._get_data_structure()
+
+    def _dataset_fingerprint(self, adata):
+        backed_path = str(adata.filename) if getattr(adata, "filename", None) else None
+        obs_first = str(adata.obs_names[0]) if adata.n_obs > 0 else ""
+        obs_last = str(adata.obs_names[-1]) if adata.n_obs > 0 else ""
+        var_first = str(adata.var_names[0]) if adata.n_vars > 0 else ""
+        var_last = str(adata.var_names[-1]) if adata.n_vars > 0 else ""
+
+        payload = {
+            "n_obs": int(adata.n_obs),
+            "n_vars": int(adata.n_vars),
+            "obs_first": obs_first,
+            "obs_last": obs_last,
+            "var_first": var_first,
+            "var_last": var_last,
+            "backed_path": backed_path,
+        }
+        if backed_path and os.path.exists(backed_path):
+            payload["backed_mtime"] = os.path.getmtime(backed_path)
+        return payload
+
+    @staticmethod
+    def _hash_payload(payload):
+        payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
+        return hashlib.sha1(payload_bytes).hexdigest()
+
+    def _cache_key(self, adata, kind, extra=None):
+        payload = {
+            "kind": kind,
+            "dataset": self._dataset_fingerprint(adata),
+            "extra": extra or {},
+        }
+        return self._hash_payload(payload)
+
+    def _cache_path(self, subdir, key, suffix):
+        if self.cache_dir is None:
+            return None
+        out_dir = self.cache_dir / subdir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / f"{key}{suffix}"
+
+    def _maybe_load_preprocessed_adata(self, adata):
+        if self.cache_dir is None or not self.cache_preprocessed:
+            return None
+
+        key = self._cache_key(
+            adata,
+            kind="preprocessed_adata",
+            extra={
+                "normalize_total": self.normalize_total,
+                "log1p": self.log1p,
+                "feature_list": [str(x) for x in self.feature_list] if self.feature_list is not None else None,
+            },
+        )
+        cache_path = self._cache_path("preprocessed", key, ".h5ad")
+        if self.reuse_cache and cache_path.exists():
+            logger.info(f"Loading preprocessed AnnData from cache: {cache_path}")
+            return sc.read_h5ad(cache_path)
+        return None
+
+    def _maybe_save_preprocessed_adata(self, adata, source_adata):
+        if self.cache_dir is None or not self.cache_preprocessed:
+            return
+
+        key = self._cache_key(
+            source_adata,
+            kind="preprocessed_adata",
+            extra={
+                "normalize_total": self.normalize_total,
+                "log1p": self.log1p,
+                "feature_list": [str(x) for x in self.feature_list] if self.feature_list is not None else None,
+            },
+        )
+        cache_path = self._cache_path("preprocessed", key, ".h5ad")
+        if cache_path.exists():
+            return
+        logger.info(f"Saving preprocessed AnnData cache: {cache_path}")
+        adata.write_h5ad(cache_path)
 
     
     def _get_data_structure(self):
@@ -148,10 +240,38 @@ class DataLoaderManager:
     def compute_neighborhood(self, adata, emb_key): # Pass adata and emb_key
         logger.info(f"Computing k-NN graph using embedding from '{emb_key}'...")
         emb = get_adata_basis(adata, basis=emb_key)
+        cache_path = None
+        if self.cache_dir is not None and self.cache_neighbors:
+            key = self._cache_key(
+                adata,
+                kind="knn_neighbors",
+                extra={
+                    "emb_key": emb_key,
+                    "k": self.sampler_knn,
+                    "metric": self.dist_metric,
+                    "use_faiss": self.use_faiss,
+                    "use_ivf": self.use_ivf,
+                    "ivf_nprobe": self.ivf_nprobe,
+                },
+            )
+            cache_path = self._cache_path("neighbors", key, ".npy")
+            if self.reuse_cache and cache_path.exists():
+                logger.info(f"Loading cached k-NN indices from: {cache_path}")
+                knn_indices = np.load(cache_path, mmap_mode="r")
+                self.neighborhood = PrecomputedNeighborhood(knn_indices=knn_indices, metric=self.dist_metric)
+                return
+
         self.neighborhood = Neighborhood(
-            emb=emb, k=self.sampler_knn, use_faiss=self.use_faiss, 
-            use_ivf=self.use_ivf, ivf_nprobe=self.ivf_nprobe, metric=self.dist_metric
+            emb=emb, k=self.sampler_knn, use_faiss=self.use_faiss,
+            use_ivf=self.use_ivf, ivf_nprobe=self.ivf_nprobe, metric=self.dist_metric,
+            num_threads=self.knn_num_threads
         )
+
+        if cache_path is not None and not cache_path.exists():
+            logger.info(f"Saving k-NN index cache to: {cache_path}")
+            full_idx = np.arange(emb.shape[0], dtype=np.int64)
+            knn_indices = self.neighborhood.get_knn(full_idx, k=self.sampler_knn, include_self=True)
+            np.save(cache_path, knn_indices.astype(np.int32))
 
 
     def build_sampler(self, SamplerClass, indices=None, neighborhood=None):
@@ -180,22 +300,33 @@ class DataLoaderManager:
             tuple: Train DataLoader, validation DataLoader (if `train_frac < 1.0`), and data structure.
         """
         self.adata = adata
+        normalize_total = self.normalize_total
+        log1p = self.log1p
 
-        if self.normalize_total:
+        cached_adata = self._maybe_load_preprocessed_adata(adata)
+        if cached_adata is not None:
+            self.adata = cached_adata
+            normalize_total = False
+            log1p = False
+
+        if normalize_total:
             logger.info("Normalizing total counts per cell...")
             sc.pp.normalize_total(self.adata, target_sum=1e4, inplace=True)
         
-        if self.log1p:
+        if log1p:
             logger.info("Log1p transforming data...")
             sc.pp.log1p(self.adata)
 
-        # Subset features if provided
-        if self.feature_list:
+        # Subset features if provided (skip when loading from matching preprocessed cache)
+        if self.feature_list and cached_adata is None:
             logger.info(f"Filtering features with provided list ({len(self.feature_list)} features)...")
             self.adata = self.adata[:, self.feature_list].copy()     # <-- copy!
             if issparse(self.adata.X):
                 self.adata.X.sort_indices()        
             #self.adata = self.adata[:, self.feature_list]
+
+        if cached_adata is None:
+            self._maybe_save_preprocessed_adata(self.adata, adata)
 
         self.domain_labels = self.adata.obs[self.domain_key]
         self.domain_ids = torch.tensor(self.domain_labels.cat.codes.values, dtype=torch.long).to(self.device)
