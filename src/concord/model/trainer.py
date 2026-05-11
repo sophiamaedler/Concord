@@ -95,6 +95,7 @@ class Trainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1, gamma=schedule_ratio)
         self.verbose  = logger.isEnabledFor(logging.INFO)
+        self.last_epoch_metrics = {}
 
     def forward_pass(self, inputs, class_labels, domain_labels, covariate_tensors=None):
         """
@@ -152,7 +153,7 @@ class Trainer:
 
         loss = loss_classifier + loss_mse + loss_clr + loss_penalty
 
-        return loss, loss_classifier, loss_mse, loss_clr, loss_penalty, class_labels, class_pred
+        return loss, loss_classifier, loss_mse, loss_clr, loss_penalty, class_labels, class_pred, decoded
 
     def train_epoch(self, epoch, train_dataloader):
         """
@@ -192,6 +193,12 @@ class Trainer:
         header = f"Epoch {epoch} {phase}"
         total_loss, total_mse, total_clr, total_classifier, total_importance_penalty = 0.0, 0.0, 0.0, 0.0, 0.0
         preds, labels = [], []
+        decoded_nonzero = 0
+        decoded_count = 0
+        decoded_sum = 0.0
+        decoded_sumsq = 0.0
+        decoded_min = float("inf")
+        decoded_max = float("-inf")
 
         if self.verbose:
             iterator = tqdm(
@@ -222,9 +229,17 @@ class Trainer:
             covariate_keys = [key for key in data_dict.keys() if key not in ['input', 'domain', 'class', 'idx']]
 
             covariate_tensors = {key: data_dict[key] for key in covariate_keys}
-            loss, loss_classifier, loss_mse, loss_clr, loss_penalty, class_labels, class_pred = self.forward_pass(
+            loss, loss_classifier, loss_mse, loss_clr, loss_penalty, class_labels, class_pred, decoded = self.forward_pass(
                 inputs, class_labels, domain_labels, covariate_tensors
             )
+            if decoded is not None:
+                decoded_detached = decoded.detach()
+                decoded_nonzero += torch.count_nonzero(decoded_detached).item()
+                decoded_count += decoded_detached.numel()
+                decoded_sum += decoded_detached.sum().item()
+                decoded_sumsq += (decoded_detached * decoded_detached).sum().item()
+                decoded_min = min(decoded_min, decoded_detached.min().item())
+                decoded_max = max(decoded_max, decoded_detached.max().item())
             # Backward pass and optimization
             if train:
                 loss.backward()
@@ -254,6 +269,27 @@ class Trainer:
             f'Epoch {epoch:3d} | {"Train" if train else "Val"} Loss:{avg_loss:5.2f}, MSE:{avg_mse:5.2f}, '
             f'CLASS:{avg_classifier:5.2f}, CONTRAST:{avg_clr:5.2f}, IMPORTANCE:{avg_importance_penalty:5.2f}'
         )
+
+        phase_key = "train" if train else "val"
+        if decoded_count > 0:
+            decoded_mean = decoded_sum / decoded_count
+            decoded_var = max((decoded_sumsq / decoded_count) - (decoded_mean * decoded_mean), 0.0)
+            decoded_std = decoded_var ** 0.5
+            decoded_frac_nonzero = decoded_nonzero / decoded_count
+            self.last_epoch_metrics[phase_key] = {
+                "decoded_frac_nonzero": decoded_frac_nonzero,
+                "decoded_mean": decoded_mean,
+                "decoded_std": decoded_std,
+                "decoded_min": decoded_min,
+                "decoded_max": decoded_max,
+            }
+            self.logger.info(
+                f'Epoch {epoch:3d} | {"Train" if train else "Val"} Decoded '
+                f'frac_nonzero:{decoded_frac_nonzero:.6f}, mean:{decoded_mean:.6g}, '
+                f'std:{decoded_std:.6g}, min:{decoded_min:.6g}, max:{decoded_max:.6g}'
+            )
+        else:
+            self.last_epoch_metrics[phase_key] = {}
         
         if self.use_classifier:
             self._log_classification(epoch, "train" if train else "val", preds, labels)

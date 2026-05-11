@@ -116,6 +116,8 @@ class Concord:
             clr_temperature=0.4,
             clr_beta=1.0,  # Beta for NT-Xent loss
             clr_weight=1.0,
+            clr_warmup_epochs=0,
+            clr_warmup_start_weight=0.0,
             use_classifier=False,
             classifier_weight=1.0,
             unlabeled_class=None,
@@ -140,6 +142,13 @@ class Concord:
             num_workers=None,  # Number of workers for DataLoader
             chunked=False,
             chunk_size=10000,
+            checkpoint_every_n_epochs=0,
+            collapse_guard_enabled=False,
+            collapse_guard_warmup_epochs=2,
+            collapse_guard_patience=2,
+            collapse_min_frac_nonzero=1e-4,
+            collapse_min_std=1e-5,
+            collapse_min_max=1e-4,
             device=torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         )
 
@@ -363,9 +372,30 @@ class Concord:
         best_val_loss = float('inf')
         best_model_state = None
         epochs_without_improvement = 0
+        collapse_epochs = 0
 
         for epoch in range(self.config.n_epochs):
             logger.info(f'Starting epoch {epoch + 1}/{self.config.n_epochs}')
+
+            # Optional linear warm-up for contrastive loss weight.
+            target_clr_weight = self.config.clr_weight
+            warmup_epochs = int(getattr(self.config, "clr_warmup_epochs", 0))
+            if warmup_epochs > 0:
+                start_weight = float(getattr(self.config, "clr_warmup_start_weight", 0.0))
+                if epoch + 1 <= warmup_epochs:
+                    progress = (epoch + 1) / warmup_epochs
+                    cur_clr_weight = start_weight + (target_clr_weight - start_weight) * progress
+                else:
+                    cur_clr_weight = target_clr_weight
+            else:
+                cur_clr_weight = target_clr_weight
+            self.trainer.clr_weight = cur_clr_weight
+            logger.info(
+                "Contrastive weight schedule: clr_weight=%.6f (target=%.6f, warmup_epochs=%d)",
+                cur_clr_weight,
+                target_clr_weight,
+                warmup_epochs,
+            )
 
             # DYNAMIC KNN UPDATE (after warm-up is complete)
             if is_warmup_active and epoch == self.config.knn_warmup_epochs:
@@ -386,6 +416,40 @@ class Concord:
                     logger.info(f"Number of samples in val_dataloader: {len(val_dataloader.dataset)}")
 
                 self.trainer.train_epoch(epoch, train_dataloader)
+
+                if self.config.use_decoder and self.config.collapse_guard_enabled:
+                    train_metrics = self.trainer.last_epoch_metrics.get("train", {})
+                    if train_metrics and (epoch + 1) > self.config.collapse_guard_warmup_epochs:
+                        frac_nz = train_metrics.get("decoded_frac_nonzero", 1.0)
+                        dec_std = train_metrics.get("decoded_std", float("inf"))
+                        dec_max = train_metrics.get("decoded_max", float("inf"))
+                        is_collapsed = (
+                            frac_nz < self.config.collapse_min_frac_nonzero
+                            or dec_std < self.config.collapse_min_std
+                            or dec_max < self.config.collapse_min_max
+                        )
+                        if is_collapsed:
+                            collapse_epochs += 1
+                            logger.warning(
+                                "Decoder collapse guard: epoch %d flagged "
+                                "(frac_nonzero=%.6f, std=%.6g, max=%.6g). "
+                                "Consecutive flagged epochs: %d/%d",
+                                epoch + 1,
+                                frac_nz,
+                                dec_std,
+                                dec_max,
+                                collapse_epochs,
+                                self.config.collapse_guard_patience,
+                            )
+                        else:
+                            collapse_epochs = 0
+
+                        if collapse_epochs >= self.config.collapse_guard_patience:
+                            raise RuntimeError(
+                                "Decoder collapse detected during training. "
+                                "See decoded epoch stats in run.log and adjust training "
+                                "hyperparameters (e.g., lr/loss weights/inputs)."
+                            )
                 
                 if val_dataloader is not None:
                     val_loss = self.trainer.validate_epoch(epoch, val_dataloader)
@@ -406,6 +470,16 @@ class Concord:
                         break
 
             self.trainer.scheduler.step()
+
+            if (
+                self.config.checkpoint_every_n_epochs
+                and self.config.checkpoint_every_n_epochs > 0
+                and self.save_dir is not None
+                and (epoch + 1) % self.config.checkpoint_every_n_epochs == 0
+            ):
+                checkpoint_path = self.save_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"
+                self.save_model(self.model, checkpoint_path)
+                logger.info(f"Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
 
             # Early stopping break condition
             if epochs_without_improvement > patience:
